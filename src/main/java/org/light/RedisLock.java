@@ -3,6 +3,7 @@ package org.light;
 import org.apache.commons.pool2.impl.GenericObjectPoolConfig;
 import redis.clients.jedis.Jedis;
 import redis.clients.jedis.JedisPool;
+import redis.clients.jedis.JedisPoolConfig;
 import redis.clients.jedis.params.SetParams;
 
 import java.net.URI;
@@ -16,19 +17,9 @@ import java.util.UUID;
  */
 public class RedisLock implements LightLock {
     /**
-     * Jedis实例
+     * 默认的分布式锁名称
      */
-    private Jedis jedis;
-
-    /**
-     * 分布式锁的Value
-     */
-    private String value;
-
-    /**
-     * 分布式锁的Key
-     */
-    private static final String KEY;
+    private static final String DEFAULT_LOCK_NAME = "RDL";
 
     /**
      * Lua脚本
@@ -43,43 +34,36 @@ public class RedisLock implements LightLock {
     /**
      * 过期时间
      */
-    private static final long EXPIRE_TIME;
+    private static final long EXPIRE_TIME = 30L;
 
     /**
-     * 默认IP地址
-     */
-    private static final String DEFAULT_HOST;
-
-    /**
-     * 默认端口
-     */
-    private static final int DEFAULT_PORT;
-
-    /**
-     * 默认数据库索引
-     */
-    private static final int DEFAULT_INDEX;
-
-    /**
-     * Redis连接池的配置信息
+     * 默认的Redis数据库连接池的配置信息
      */
     private static final GenericObjectPoolConfig<Jedis> DEFAULT_POOL_CONFIG;
 
+    /**
+     * Jedis实例
+     */
+    private final Jedis jedis;
+
+    /**
+     * 分布式锁的Key
+     */
+    private String lockName = DEFAULT_LOCK_NAME;
+
+    /**
+     * 分布式锁的Value
+     */
+    private String value;
+
     static {
-        KEY = "RDL";
         LUA_SCRIPT = "if redis.call(\"GET\", KEYS[1]) == ARGV[1]\n" +
                         "then\n" +
                         "    return redis.call(\"DEL\", KEYS[1])\n" +
                         "else\n" +
                         "    return 0\n" +
                         "end";
-        EXPIRE_TIME = 30L;
-
-        DEFAULT_HOST = "127.0.0.1";
-        DEFAULT_PORT = 6379;
-        DEFAULT_INDEX = 0;
-
-        DEFAULT_POOL_CONFIG = new GenericObjectPoolConfig<>();
+        DEFAULT_POOL_CONFIG = new JedisPoolConfig();
         // 连接池最大空闲数
         DEFAULT_POOL_CONFIG.setMaxIdle(300);
         // 最大连接数
@@ -90,15 +74,20 @@ public class RedisLock implements LightLock {
     }
 
     public RedisLock() {
-        this(DEFAULT_HOST, DEFAULT_PORT, DEFAULT_INDEX);
+        this("127.0.0.1", 6379, 0);
     }
 
     public RedisLock(String host) {
-        this(host, DEFAULT_PORT);
+        /**
+         * Redis数据库连接池的配置信息
+         */
+        JEDIS_POOL = new JedisPool(DEFAULT_POOL_CONFIG, host);
+        jedis = JEDIS_POOL.getResource();
+        jedis.select(0);
     }
 
     public RedisLock(String host, int port) {
-        this(host, port, DEFAULT_INDEX);
+        this(host, port, 0);
     }
 
     public RedisLock(String host, int port, int index) {
@@ -108,7 +97,7 @@ public class RedisLock implements LightLock {
     }
 
     public RedisLock(URI uri) {
-        this(uri.getHost(), uri.getPort(), DEFAULT_INDEX);
+        this(uri.getHost(), uri.getPort(), 0);
     }
 
     public RedisLock(URI uri, int index) {
@@ -116,8 +105,13 @@ public class RedisLock implements LightLock {
     }
 
     public RedisLock(JedisPool jedisPool) {
+        this(jedisPool, 0);
+    }
+
+    public RedisLock(JedisPool jedisPool, int index) {
         JEDIS_POOL = jedisPool;
         jedis = JEDIS_POOL.getResource();
+        jedis.select(index);
     }
 
     /**
@@ -125,11 +119,17 @@ public class RedisLock implements LightLock {
      */
     @Override
     public void lock() {
-        // 自旋
+        lock(lockName);
+    }
+
+    @Override
+    public void lock(String lockName) {
+        value = UUID.randomUUID() + ":" + Thread.currentThread().getId();
         while (true) {
-            value = UUID.randomUUID() + ":" + Thread.currentThread().getId();
-            String result = jedis.set(KEY, value, new SetParams().nx().ex(EXPIRE_TIME));
-            if (result != null && result.equals("OK")) break;
+            String result = jedis.set(lockName, value, new SetParams().nx().ex(EXPIRE_TIME));
+            if ("OK".equals(result)) {
+                break;
+            }
         }
 
         // 守护线程
@@ -138,9 +138,14 @@ public class RedisLock implements LightLock {
 
     @Override
     public boolean tryLock() {
+        return tryLock(lockName);
+    }
+
+    @Override
+    public boolean tryLock(String lockName) {
         // 快速失败
         value = UUID.randomUUID() + ":" + Thread.currentThread().getId();
-        String result = jedis.set(KEY, value, new SetParams().nx().ex(EXPIRE_TIME));
+        String result = jedis.set(lockName, value, new SetParams().nx().ex(EXPIRE_TIME));
         if (result == null || !result.equals("OK")) return false;
 
         // 守护线程
@@ -154,13 +159,13 @@ public class RedisLock implements LightLock {
     private void daemon() {
         new Thread(() -> {
             while (true) {
-                Long ttl = jedis.ttl(KEY);
+                Long ttl = jedis.ttl(lockName);
                 if (ttl == -2L || ttl == -1L) {
                     System.out.println("锁已经失效！");
                     break;
                 }
                 if (ttl <= 5) {
-                    jedis.expire(KEY, EXPIRE_TIME);
+                    jedis.expire(lockName, EXPIRE_TIME);
                 }
             }
         }, "RedisLockDaemonThread");
@@ -173,15 +178,27 @@ public class RedisLock implements LightLock {
     public void unlock() {
         try {
             jedis.eval(LUA_SCRIPT,
-                    Collections.singletonList(KEY),
+                    Collections.singletonList(lockName),
                     Collections.singletonList(value));
         } finally {
             jedis.close();
         }
     }
 
+    /**
+     * 配置使用哪个Redis数据库
+     * @param index 使用的Redis数据库索引
+     */
     public void setIndex(int index) {
         if (jedis == null) throw new NullPointerException("Jedis实例为空！");
         jedis.select(index);
+    }
+
+    /**
+     * 设置锁名称
+     * @param lockName 锁名称
+     */
+    public void setLockName(String lockName) {
+        this.lockName = lockName;
     }
 }
